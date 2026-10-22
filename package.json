@@ -1,0 +1,30 @@
+{
+  "name": "pi-advice",
+  "version": "0.1.0",
+  "description": "Second opinion for Pi: /advise reviews the live session and says what is wrong; /discuss runs up to 6 archetype agents (Contrarian, Confidant, Analyst, Visionary, Pragmatist, Explorer) on any model you pick.",
+  "author": "amirulaliffcherahim",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amirulaliffcherahim/pi-advice.git"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "keywords": ["pi-package", "pi-extension", "advisor", "second-opinion", "discussion"],
+  "files": ["LICENSE", "README.md", "src", "tsconfig.json"],
+  "scripts": {
+    "test": "node --test test/advice.test.ts"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
