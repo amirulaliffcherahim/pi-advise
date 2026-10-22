@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/amirulaliffcherahim/pi-advice.git"
+    "url": "git+https://github.com/amirulaliffcherahim/pi-advise.git"
   },
   "type": "module",
   "main": "./src/index.ts",

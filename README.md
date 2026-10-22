@@ -54,7 +54,7 @@ The advisor and discussion agents receive the session's own system prompt (Pi ru
 The transcript is sent to whichever model you pick, so obvious secrets (API keys, tokens, JWTs, private keys, `password=…`) are redacted first. Pattern-based, not a guarantee. Esc cancels a running call.
 
 ## Install
-`pi install git:github.com/amirulaliffcherahim/pi-advice`, or `pi -e ./src/index.ts` to try it.
+`pi install git:github.com/amirulaliffcherahim/pi-advise`, or `pi -e ./src/index.ts` to try it.
 
 `npm test` runs the tests (Node ≥ 22.15, needs Pi's packages resolvable).
 
