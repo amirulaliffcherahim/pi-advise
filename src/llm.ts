@@ -35,9 +35,80 @@ export interface AskOptions {
   user: string;
   signal?: AbortSignal;
   onText?: (soFar: string) => void;
+  /** Per attempt. Default 180s. */
+  timeoutMs?: number;
+  /** Extra attempts on transient errors only. Default 2. */
+  retries?: number;
+  retryDelayMs?: number;
 }
 
+const TRANSIENT = /\b(429|500|502|503|504|529)\b|rate.?limit|overload|temporar|unavailable|timed? ?out|timeout|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket|network|capacity/i;
+export const isTransient = (message: string): boolean => TRANSIENT.test(message);
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+  });
+
+/** One attempt, bounded by a timeout. User cancel and timeout are told apart. */
+const askOnce = async (ctx: ExtensionContext, o: AskOptions): Promise<AskResult> => {
+  const timeoutMs = o.timeoutMs ?? 180_000;
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = o.signal ? AbortSignal.any([o.signal, timeout]) : timeout;
+  try {
+    return await streamOnce(ctx, { ...o, signal });
+  } catch (e) {
+    if (o.signal?.aborted) throw new Error("Cancelled.");
+    if (timeout.aborted) throw new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    throw e;
+  }
+};
+
 export const ask = async (ctx: ExtensionContext, o: AskOptions): Promise<AskResult> => {
+  const retries = o.retries ?? 2;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await askOnce(ctx, o);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (o.signal?.aborted || attempt >= retries || !isTransient(msg)) throw e;
+      await sleep((o.retryDelayMs ?? 800) * 2 ** attempt, o.signal);
+      if (o.signal?.aborted) throw new Error("Cancelled.");
+    }
+  }
+};
+
+export interface ResilientOptions extends Omit<AskOptions, "model" | "effort"> {
+  effort?: Effort;
+}
+export interface ResilientResult extends AskResult {
+  ref: string;
+  /** Set when the chosen model failed and the session model answered instead. */
+  fellBackFrom?: string;
+  primaryError?: string;
+}
+
+/** Ask the chosen model; on a hard failure, fall back once to the session model. Never falls back after a cancel. */
+export const askResilient = async (
+  ctx: ExtensionContext,
+  cfg: { fallback: boolean; timeoutSec: number },
+  primary: { model: Model<Api>; ref: string },
+  o: ResilientOptions,
+): Promise<ResilientResult> => {
+  const base = { timeoutMs: cfg.timeoutSec * 1000, ...o };
+  try {
+    return { ...(await ask(ctx, { ...base, model: primary.model })), ref: primary.ref };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const session = ctx.model;
+    if (o.signal?.aborted || !cfg.fallback || !session || refOf(session) === primary.ref) throw e;
+    const res = await ask(ctx, { ...base, model: session, effort: undefined });
+    return { ...res, ref: refOf(session), fellBackFrom: primary.ref, primaryError: msg };
+  }
+};
+
+const streamOnce = async (ctx: ExtensionContext, o: AskOptions): Promise<AskResult> => {
   const stream = ctx.modelRegistry.streamSimple(
     o.model,
     { systemPrompt: o.system, messages: [{ role: "user", content: o.user, timestamp: Date.now() }] },

@@ -1,13 +1,14 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MAX_ROUNDS, type AdviceConfig, type AgentSlot } from "./config.ts";
-import { ask, resolveSlot, sumUsage } from "./llm.ts";
+import { askResilient, resolveSlot, sumUsage } from "./llm.ts";
 import { ARCHETYPES, DISCUSS_SYSTEM_PROMPT, SYNTH_SYSTEM_PROMPT, archetypeById, withStyle, type Archetype } from "./personas.ts";
 import { buildTranscript, sessionRules } from "./transcript.ts";
 
 export interface Turn {
   who: Archetype;
   model: string;
+  fellBackFrom?: string;
   round: number;
   text?: string;
   error?: string;
@@ -106,8 +107,7 @@ export const runDiscuss = async (
       turns.push(turn);
       calls++;
       try {
-        const res = await ask(ctx, {
-          model: r.model,
+        const res = await askResilient(ctx, cfg, r, {
           effort: r.slot.effort,
           system: withStyle(DISCUSS_SYSTEM_PROMPT(r.who, others), cfg.caveman, !!rules),
           user,
@@ -116,6 +116,8 @@ export const runDiscuss = async (
             o.onProgress?.({ speaker: r.who, round, rounds, partial, done: turns, phase: "turn" }),
         });
         turn.text = res.text;
+        turn.model = res.ref;
+        if (res.fellBackFrom) turn.fellBackFrom = res.fellBackFrom;
         usages.push(res.usage);
       } catch (e) {
         if (o.signal?.aborted) throw e;
@@ -133,8 +135,7 @@ export const runDiscuss = async (
   if (synth) {
     calls++;
     try {
-      const res = await ask(ctx, {
-        model: synth.model,
+      const res = await askResilient(ctx, cfg, synth, {
         effort: cfg.discuss.synth.effort,
         system: withStyle(SYNTH_SYSTEM_PROMPT, cfg.caveman, false),
         user: `${topicLine}\n\nDiscussion:\n${transcriptOf(turns)}`,
@@ -142,7 +143,7 @@ export const runDiscuss = async (
         onText: (partial) =>
           o.onProgress?.({ speaker: resolved[0].who, round: rounds, rounds, partial, done: turns, phase: "wrapup" }),
       });
-      result.synthesis = { text: res.text, model: synth.ref };
+      result.synthesis = { text: res.text, model: res.ref };
       usages.push(res.usage);
     } catch (e) {
       if (o.signal?.aborted) throw e;
@@ -166,7 +167,7 @@ export const formatDiscussion = (r: DiscussResult): string => {
     }
     parts.push(
       t.text
-        ? `**${t.who.name}** _(${t.model})_\n${t.text}`
+        ? `**${t.who.name}** _(${t.model}${t.fellBackFrom ? `, fallback from ${t.fellBackFrom}` : ""})_\n${t.text}`
         : `**${t.who.name}** _(${t.model})_\n_failed: ${t.error ?? "no reply"}_`,
     );
   }
@@ -174,3 +175,10 @@ export const formatDiscussion = (r: DiscussResult): string => {
   else if (r.synthesisError) parts.push(`### Wrap-up\n_failed: ${r.synthesisError}_`);
   return parts.join("\n\n");
 };
+
+/** Same as formatDiscussion but flags a failed or fallen-back model in one line for notifications. */
+export const discussionWarnings = (r: DiscussResult): string[] => [
+  ...r.turns.filter((t) => t.error).map((t) => `${t.who.name} failed: ${t.error}`),
+  ...r.turns.filter((t) => t.fellBackFrom).map((t) => `${t.who.name}: ${t.fellBackFrom} failed, used ${t.model}`),
+  ...(r.synthesisError ? [`wrap-up failed: ${r.synthesisError}`] : []),
+];

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runAdvise } from "../src/advise.ts";
 import { defaultConfig, sanitize } from "../src/config.ts";
-import { formatDiscussion, planCalls, runDiscuss } from "../src/discuss.ts";
+import { discussionWarnings, formatDiscussion, planCalls, runDiscuss } from "../src/discuss.ts";
+import { askResilient } from "../src/llm.ts";
 import { buildTranscript, redact } from "../src/transcript.ts";
 
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 } };
@@ -203,4 +204,74 @@ test("session rules reach advise + discuss; caveman on by default and can be tur
   d.ctx.getSystemPrompt = () => "HOUSE RULE: be safe";
   await runDiscuss(d.ctx, cfg, { topic: "t", includeSession: false });
   assert.ok(!d.calls[0].user.includes("HOUSE RULE"), "no session data unless asked");
+});
+
+test("sanitize: new robustness fields validated", () => {
+  const c = sanitize({ fallback: "yes", timeoutSec: 1, nudge: false });
+  assert.equal(c.fallback, true);
+  assert.equal(c.timeoutSec, 10);
+  assert.equal(c.nudge, false);
+  assert.equal(sanitize({ timeoutSec: 99999 }).timeoutSec, 900);
+});
+
+test("retries transient errors then succeeds; permanent errors are not retried", async () => {
+  let n = 0;
+  const a = makeCtx(session, () => (++n < 3 ? new Error("503 overloaded") : "VERDICT: SOUND"));
+  const r = await runAdvise(a.ctx, { ...defaultConfig(), fallback: false }, {});
+  assert.equal(a.calls.length, 3);
+  assert.match(r.text, /SOUND/);
+
+  const b = makeCtx(session, () => new Error("invalid api key"));
+  await assert.rejects(runAdvise(b.ctx, { ...defaultConfig(), fallback: false }, {}), /invalid api key/);
+  assert.equal(b.calls.length, 1, "no retry on a permanent error");
+});
+
+test("falls back to the session model when the chosen model is down, and says so", async () => {
+  const a = makeCtx(session, (_s, _u, id) => (id === "two" ? new Error("invalid api key") : "VERDICT: SOUND"));
+  const cfg = defaultConfig();
+  cfg.advise = { model: "a/two" };
+  const r = await runAdvise(a.ctx, cfg, {});
+  assert.equal(r.model, "a/one");
+  assert.equal(r.fellBackFrom, "a/two");
+  assert.match(r.primaryError ?? "", /invalid api key/);
+
+  const off = makeCtx(session, (_s, _u, id) => (id === "two" ? new Error("invalid api key") : "ok"));
+  await assert.rejects(runAdvise(off.ctx, { ...cfg, fallback: false }, {}), /invalid api key/);
+});
+
+test("discuss: a failing agent model falls back and is flagged; cancel never falls back", async () => {
+  const a = makeCtx(session, (_s, _u, id) => (id === "two" ? new Error("invalid api key") : "fine"));
+  const cfg = defaultConfig();
+  cfg.discuss.rounds = 1;
+  cfg.discuss.agents.find((x) => x.id === "contrarian")!.model = "a/two";
+  const r = await runDiscuss(a.ctx, cfg, { topic: "t", includeSession: false });
+  const t = r.turns[0];
+  assert.equal(t.model, "a/one");
+  assert.equal(t.fellBackFrom, "a/two");
+  assert.ok(discussionWarnings(r).some((w) => /fell|failed|used/.test(w)));
+  assert.match(formatDiscussion(r), /fallback from a\/two/);
+
+  const b = makeCtx(session, () => "ok");
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(runDiscuss(b.ctx, cfg, { topic: "t", includeSession: false, signal: ac.signal }), /Cancelled/);
+  assert.equal(b.calls.length, 0);
+});
+
+test("timeout is reported as a timeout, not a hang", async () => {
+  const slow: any = makeCtx(session, () => "x");
+  slow.ctx.modelRegistry.streamSimple = (_m: any, _c: any, opts: any) => ({
+    async *[Symbol.asyncIterator]() {
+      await new Promise((_, rej) => opts.signal.addEventListener("abort", () => rej(new Error("aborted")), { once: true }));
+    },
+    async result() {
+      return { stopReason: "aborted", content: [], usage };
+    },
+  });
+  const t0 = Date.now();
+  await assert.rejects(
+    askResilient(slow.ctx, { fallback: false, timeoutSec: 0 }, { model: slow.ctx.model, ref: "a/one" }, { system: "s", user: "u", timeoutMs: 80, retries: 0 }),
+    /Timed out/,
+  );
+  assert.ok(Date.now() - t0 < 2000);
 });

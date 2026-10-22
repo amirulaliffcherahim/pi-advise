@@ -39,6 +39,14 @@ The agent gets `advise` and `discuss` tools and guidance to use `advise` before 
 ## Config: `~/.pi/agent/pi-advice.json`
 Written by the model commands. Unset model = follow the session model. Fields: `advise`, `discuss.{rounds,wrapUp,synth,agents[]}`, `agentTools`, `maxAgentCalls`, `maxContextChars`. Invalid values fall back to defaults.
 
+## Robust by default
+- **Retries** transient errors (429/5xx/overload/network) twice with backoff. Permanent errors (bad key, bad model) fail at once.
+- **Timeout** 180s per call (`timeoutSec`). Reported as a timeout, not a hang.
+- **Fallback**: if your chosen model fails, the session model answers instead and the result says so (`fallback: false` to disable). Cancelling never falls back.
+- **One run at a time**: a second `/advise`, `/discuss` or agent call while one runs is refused instead of doubling cost. Esc cancels; quitting Pi aborts any run.
+- **Nudge**: after 2 tool failures in a row, the agent is told once to call `advise` (no model call spent; `nudge: false` to disable).
+- The footer shows the last verdict (`advice: needs changes`). Agent-called `advise`/`discuss` render with the same box as the commands and stream live while running.
+
 ## Rules and style
 The advisor and discussion agents receive the session's own system prompt (Pi rules, house rules) as `<session_rules>`, redacted and size-capped. They follow its constraints and report when the session broke them. Manual `/advise` never starts an agent turn unless you pass `--act`; if the agent is busy, the advice is queued for its next model call.
 
@@ -49,3 +57,4 @@ The transcript is sent to whichever model you pick, so obvious secrets (API keys
 `pi install git:github.com/amirulaliffcherahim/pi-advice`, or `pi -e ./src/index.ts` to try it.
 
 `npm test` runs the tests (Node ≥ 22.15, needs Pi's packages resolvable).
+

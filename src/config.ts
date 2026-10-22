@@ -28,6 +28,12 @@ export interface AdviceConfig {
   /** Let the session agent call the advise/discuss tools on its own. */
   /** Terse caveman replies from advisor/discussion models to save tokens. */
   caveman: boolean;
+  /** If the chosen model fails, retry once on the session model instead of giving up. */
+  fallback: boolean;
+  /** Per model call, retries included only per attempt. */
+  timeoutSec: number;
+  /** Tell the agent to consider `advise` after repeated tool failures (costs no model call). */
+  nudge: boolean;
   agentTools: boolean;
   /** Max agent-initiated calls per Pi process (manual commands are never limited). */
   maxAgentCalls: number;
@@ -46,6 +52,9 @@ export const defaultConfig = (): AdviceConfig => ({
     agents: ARCHETYPES.map((a) => ({ id: a.id, enabled: DEFAULT_ENABLED.includes(a.id) })),
   },
   caveman: true,
+  fallback: true,
+  timeoutSec: 180,
+  nudge: true,
   agentTools: true,
   maxAgentCalls: 10,
   maxContextChars: 120_000,
@@ -92,6 +101,9 @@ export const sanitize = (raw: unknown): AdviceConfig => {
       agents,
     },
     caveman: typeof r.caveman === "boolean" ? r.caveman : d.caveman,
+    fallback: typeof r.fallback === "boolean" ? r.fallback : d.fallback,
+    timeoutSec: int(r.timeoutSec, 10, 900, d.timeoutSec),
+    nudge: typeof r.nudge === "boolean" ? r.nudge : d.nudge,
     agentTools: typeof r.agentTools === "boolean" ? r.agentTools : d.agentTools,
     maxAgentCalls: int(r.maxAgentCalls, 0, 1000, d.maxAgentCalls),
     maxContextChars: int(r.maxContextChars, 4_000, 1_000_000, d.maxContextChars),

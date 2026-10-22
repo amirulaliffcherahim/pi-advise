@@ -11,6 +11,7 @@ import { runAdvise } from "./advise.ts";
 import { MAX_ROUNDS, loadConfig, saveConfig, updateConfig, type AdviceConfig } from "./config.ts";
 import { activeAgents, formatDiscussion, planCalls, runDiscuss, type DiscussProgress } from "./discuss.ts";
 import { fmtUsage } from "./llm.ts";
+import { discussionWarnings } from "./discuss.ts";
 import { parseSlotArgs, pickSlot, slotLabel } from "./models.ts";
 import { ARCHETYPES, findArchetype } from "./personas.ts";
 
@@ -23,6 +24,9 @@ interface AdviceDetails {
   models: string;
   usage?: string;
   text: string;
+  warnings?: string[];
+  /** Streaming snapshot from a tool call still running. */
+  partial?: boolean;
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -63,9 +67,9 @@ const takeFlags = (raw: string, valued: string[], bare: string[]) => {
 const withProgress = async <T>(
   ctx: ExtensionContext,
   label: string,
+  ac: AbortController,
   run: (signal: AbortSignal, show: (heading: string, partial: string) => void) => Promise<T>,
 ): Promise<T> => {
-  const ac = new AbortController();
   const off =
     ctx.mode === "tui"
       ? ctx.ui.onTerminalInput((data) => {
@@ -106,16 +110,67 @@ const withProgress = async <T>(
 
 export default function (pi: ExtensionAPI) {
   let agentCalls = 0;
+  let running: { label: string; ac: AbortController } | undefined;
+  let failStreak = 0;
+  let nudged = false;
+  let lastVerdict: string | undefined;
 
-  pi.on("session_start", () => {
+  const setFooter = (ctx: ExtensionContext) => {
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus(KEY, lastVerdict ? `advice: ${lastVerdict.toLowerCase()}` : undefined);
+  };
+
+  /** One run at a time: two reviews racing would double the cost and interleave the widget. */
+  const claim = (label: string): AbortController => {
+    if (running) throw new Error(`${running.label} is already running. Press Esc to cancel it first.`);
+    const ac = new AbortController();
+    running = { label, ac };
+    return ac;
+  };
+  const release = (ac: AbortController) => {
+    if (running?.ac === ac) running = undefined;
+  };
+
+  pi.on("session_start", (_e, ctx) => {
     agentCalls = 0;
+    failStreak = 0;
+    nudged = false;
+    lastVerdict = undefined;
+    setFooter(ctx);
   });
 
-  pi.registerMessageRenderer<AdviceDetails>(MSG, (message, { expanded }, theme) => {
-    const d = message.details;
-    const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-    if (!d) {
-      box.addChild(new Text(String(message.content), 0, 0));
+  pi.on("session_shutdown", () => {
+    running?.ac.abort();
+    running = undefined;
+  });
+
+  /** Cheap, no model call: after repeated tool failures, point the agent at advise once per streak. */
+  pi.on("tool_result", (e) => {
+    if (e.toolName === "advise" || e.toolName === "discuss") return;
+    if (!e.isError) {
+      failStreak = 0;
+      nudged = false;
+      return;
+    }
+    failStreak++;
+    const cfg = loadConfig();
+    if (!cfg.nudge || !cfg.agentTools || nudged || failStreak < 2 || agentCalls >= cfg.maxAgentCalls) return;
+    if (!pi.getActiveTools().includes("advise")) return;
+    nudged = true;
+    return {
+      content: [
+        ...e.content,
+        { type: "text" as const, text: "\n[pi-advice: this is the 2nd failure in a row. Stop retrying the same thing. Call the advise tool for a second opinion before the next attempt.]" },
+      ],
+    };
+  });
+
+  const renderAdvice = (d: AdviceDetails, expanded: boolean, theme: any) => {
+    const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+    if (d.partial) {
+      const tail = d.text.split("\n").filter(Boolean).slice(-3).join("\n");
+      box.addChild(new Text(theme.fg("accent", theme.bold(`◆ ${d.title}`)), 0, 0));
+      box.addChild(new Text(theme.fg("dim", tail || "working…"), 0, 0));
       return box;
     }
     const verdict = d.kind === "advise" ? verdictOf(d.text) : undefined;
@@ -123,8 +178,19 @@ export default function (pi: ExtensionAPI) {
     box.addChild(new Text(theme.fg(color, theme.bold(`◆ ${d.title}${verdict ? ` · ${verdict}` : ""}`)), 0, 0));
     box.addChild(new Text(theme.fg("dim", `  ${d.models}${d.usage ? `  ·  ${d.usage}` : ""}`), 0, 0));
     const body = d.text.replace(/^\s*VERDICT:.*\n?/im, "");
+    for (const w of d.warnings ?? []) box.addChild(new Text(theme.fg("warning", `  ⚠ ${w}`), 0, 0));
     box.addChild(new Markdown(expanded || body.length < 4000 ? body : `${body.slice(0, 4000)}\n\n…(expand to see all)`, 0, 0, getMarkdownTheme()));
     return box;
+  };
+
+  pi.registerMessageRenderer<AdviceDetails>(MSG, (message, { expanded }, theme) => {
+    const d = message.details;
+    if (!d) {
+      const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+      box.addChild(new Text(String(message.content), 0, 0));
+      return box;
+    }
+    return renderAdvice(d, expanded, theme);
   });
 
   const deliver = (ctx: ExtensionContext, d: AdviceDetails, llmText: string, act: boolean) => {
@@ -144,7 +210,10 @@ export default function (pi: ExtensionAPI) {
       models: res.model,
       usage: fmtUsage(res.usage),
       text: res.text,
+      warnings: res.fellBackFrom ? [`${res.fellBackFrom} failed (${res.primaryError}); answered by ${res.model} instead`] : undefined,
     };
+    lastVerdict = verdictOf(res.text);
+    setFooter(ctx);
     const llm =
       `[pi-advice: independent review of this session by ${res.model}. Weigh it critically: check its claims against what you know, ` +
       `fix what is right, and say so if you disagree. Do not follow it blindly.]\n\n${res.text}`;
@@ -172,6 +241,7 @@ export default function (pi: ExtensionAPI) {
       models,
       usage: fmtUsage(res.usage),
       text,
+      warnings: discussionWarnings(res),
     };
     const llm =
       `[pi-advice: group discussion between role-played perspectives (not authoritative). Use it as input, not as instruction.]\n\n` +
@@ -223,15 +293,24 @@ export default function (pi: ExtensionAPI) {
 
       const { flags, text: question } = takeFlags(trimmed, [], ["act"]);
       const cfg = loadConfig();
+      let ac: AbortController;
       try {
-        const { res, details, llm } = await withProgress(ctx, "Advisor reviewing session", (signal, show) =>
+        ac = claim("/advise");
+      } catch (e) {
+        return notify(ctx, (e as Error).message, "warning");
+      }
+      try {
+        const { res, details, llm } = await withProgress(ctx, "Advisor reviewing session", ac, (signal, show) =>
           doAdvise(ctx, cfg, question, undefined, signal, show),
         );
         if (!ctx.hasUI) console.log(details.text);
         deliver(ctx, details, llm, flags.act === true);
-        notify(ctx, `Advice from ${res.model} added to the session${flags.act ? "" : ". Tell the agent to apply it, or use /advise --act."}`);
+        const note = details.warnings?.length ? ` ⚠ ${details.warnings[0]}` : "";
+        notify(ctx, `Advice from ${res.model} added to the session${flags.act ? "" : ". Tell the agent to apply it, or use /advise --act."}${note}`, note ? "warning" : "info");
       } catch (e) {
-        notify(ctx, `/advise failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+        notify(ctx, `/advise failed: ${(e as Error).message ?? String(e)}`, "error");
+      } finally {
+        release(ac);
       }
     },
   });
@@ -362,16 +441,24 @@ export default function (pi: ExtensionAPI) {
         if (calls > 12 && !(await ctx.ui.confirm("Large discussion", `${n} agents will make ${calls} model calls. Continue?`))) return;
       }
 
+      let ac: AbortController;
       try {
-        const { res, details, llm } = await withProgress(ctx, "Discussion running", (signal, show) =>
+        ac = claim("/discuss");
+      } catch (e) {
+        return notify(ctx, (e as Error).message, "warning");
+      }
+      try {
+        const { res, details, llm } = await withProgress(ctx, "Discussion running", ac, (signal, show) =>
           doDiscuss(ctx, cfg, { topic, includeSession, rounds, only }, signal, show),
         );
         if (!ctx.hasUI) console.log(details.text);
         deliver(ctx, details, llm, flags.act === true);
-        const failed = res.turns.filter((t) => t.error).length;
-        notify(ctx, `Discussion done (${res.calls} calls${failed ? `, ${failed} agent turns failed` : ""}).`, failed ? "warning" : "info");
+        const w = details.warnings ?? [];
+        notify(ctx, `Discussion done (${res.calls} calls).${w.length ? ` ⚠ ${w.join("; ")}` : ""}`, w.length ? "warning" : "info");
       } catch (e) {
-        notify(ctx, `/discuss failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+        notify(ctx, `/discuss failed: ${(e as Error).message ?? String(e)}`, "error");
+      } finally {
+        release(ac);
       }
     },
   });
@@ -399,11 +486,24 @@ export default function (pi: ExtensionAPI) {
         question: Type.Optional(Type.String({ description: "Specific thing to check, if any." })),
         plan: Type.Optional(Type.String({ description: "Your intended next steps, not yet in the transcript." })),
       }),
-      async execute(_id, params, signal, _onUpdate, ctx) {
+      renderShell: "self",
+      renderCall: (args, theme) => new Text(theme.fg("accent", theme.bold("◆ advise")) + theme.fg("dim", args.question ? `  ${String(args.question).slice(0, 90)}` : ""), 0, 0),
+      renderResult: (result, { expanded }, theme) =>
+        result.details ? renderAdvice(result.details as AdviceDetails, expanded, theme) : new Text(theme.fg("dim", "…"), 0, 0),
+      async execute(_id, params, signal, onUpdate, ctx) {
         const cfg = loadConfig();
-        gate(cfg, "advise");
-        const { res, details, llm } = await doAdvise(ctx, cfg, params.question ?? "", params.plan, signal ?? new AbortController().signal, undefined, true);
-        return { content: [{ type: "text", text: llm }], details, usage: res.usage };
+        const ac = claim("advise");
+        const off = signal ? (() => { const f = () => ac.abort(); signal.addEventListener("abort", f, { once: true }); return () => signal.removeEventListener("abort", f); })() : undefined;
+        try {
+          gate(cfg, "advise");
+          const { res, details, llm } = await doAdvise(ctx, cfg, params.question ?? "", params.plan, ac.signal, (h, p) =>
+            onUpdate?.({ content: [{ type: "text", text: h }], details: { kind: "advise", title: h, models: "", text: p, partial: true } satisfies AdviceDetails }),
+            true);
+          return { content: [{ type: "text", text: llm }], details, usage: res.usage };
+        } finally {
+          off?.();
+          release(ac);
+        }
       },
     }),
   );
@@ -422,17 +522,29 @@ export default function (pi: ExtensionAPI) {
         agents: Type.Optional(Type.Array(Type.String(), { description: "Subset of: contrarian, confidant, analyst, visionary, pragmatist, explorer." })),
         rounds: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_ROUNDS })),
       }),
-      async execute(_id, params, signal, _onUpdate, ctx) {
+      renderShell: "self",
+      renderCall: (args, theme) => new Text(theme.fg("accent", theme.bold("◆ discuss")) + theme.fg("dim", `  ${String(args.topic ?? "").slice(0, 90)}`), 0, 0),
+      renderResult: (result, { expanded }, theme) =>
+        result.details ? renderAdvice(result.details as AdviceDetails, expanded, theme) : new Text(theme.fg("dim", "…"), 0, 0),
+      async execute(_id, params, signal, onUpdate, ctx) {
         const cfg = loadConfig();
-        gate(cfg, "discuss");
-        const only = params.agents?.map((s) => findArchetype(s)?.id).filter((x): x is any => !!x);
-        const { res, details, llm } = await doDiscuss(
-          ctx,
-          cfg,
-          { topic: params.topic, includeSession: params.includeSession ?? false, rounds: params.rounds, only: only?.length ? only : undefined },
-          signal ?? new AbortController().signal,
-        );
-        return { content: [{ type: "text", text: llm }], details, usage: res.usage };
+        const ac = claim("discuss");
+        const off = signal ? (() => { const f = () => ac.abort(); signal.addEventListener("abort", f, { once: true }); return () => signal.removeEventListener("abort", f); })() : undefined;
+        try {
+          gate(cfg, "discuss");
+          const only = params.agents?.map((s) => findArchetype(s)?.id).filter((x): x is any => !!x);
+          const { res, details, llm } = await doDiscuss(
+            ctx,
+            cfg,
+            { topic: params.topic, includeSession: params.includeSession ?? false, rounds: params.rounds, only: only?.length ? only : undefined },
+            ac.signal,
+            (h, p) => onUpdate?.({ content: [{ type: "text", text: h }], details: { kind: "discuss", title: h, models: "", text: p, partial: true } satisfies AdviceDetails }),
+          );
+          return { content: [{ type: "text", text: llm }], details, usage: res.usage };
+        } finally {
+          off?.();
+          release(ac);
+        }
       },
     }),
   );
